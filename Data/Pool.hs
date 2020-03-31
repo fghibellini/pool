@@ -266,7 +266,7 @@ withResource ::
 withResource pool act = control $ \runInIO -> mask $ \restore -> do
   (resource, local) <- takeResource pool
   ret <- restore (runInIO (act resource)) `onException`
-            destroyResource pool local resource
+            destroyResource_ pool local ExceptionThrown resource
   putResource local resource
   return ret
 #if __GLASGOW_HASKELL__ >= 700
@@ -315,7 +315,7 @@ tryWithResource pool act = control $ \runInIO -> mask $ \restore -> do
   case res of
     Just (resource, local) -> do
       ret <- restore (runInIO (Just <$> act resource)) `onException`
-                destroyResource pool local resource
+                destroyResource_ pool local ExceptionThrown resource
       putResource local resource
       return ret
     Nothing -> restore . runInIO $ return (Nothing :: Maybe b)
@@ -360,11 +360,17 @@ getLocalPool Pool{..} = do
 -- | Destroy a resource. Note that this will ignore any exceptions in the
 -- destroy function.
 destroyResource :: Pool a -> LocalPool a -> a -> IO ()
-destroyResource Pool{..} LocalPool{..} resource = do
-   destroy ManualInvocation resource `E.catch` \(_::SomeException) -> return ()
-   atomically (modifyTVar_ inUse (subtract 1))
+destroyResource pool localPool resource = destroyResource_ pool localPool ManualInvocation resource
 #if __GLASGOW_HASKELL__ >= 700
 {-# INLINABLE destroyResource #-}
+#endif
+
+destroyResource_ :: Pool a -> LocalPool a -> DestroyReason -> a -> IO ()
+destroyResource_ Pool{..} LocalPool{..} reason resource = do
+   destroy reason resource `E.catch` \(_::SomeException) -> return ()
+   atomically (modifyTVar_ inUse (subtract 1))
+#if __GLASGOW_HASKELL__ >= 700
+{-# INLINABLE destroyResource_ #-}
 #endif
 
 -- | Return a resource to the given 'LocalPool'.
