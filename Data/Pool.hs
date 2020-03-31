@@ -31,6 +31,7 @@ module Data.Pool
     (
       Pool(idleTime, maxResources, numStripes)
     , LocalPool
+    , DestroyReason(..)
     , createPool
     , withResource
     , takeResource
@@ -90,10 +91,17 @@ data LocalPool a = LocalPool {
     -- ^ empty value used to attach a finalizer to (internal)
     } deriving (Typeable)
 
+data DestroyReason
+  = ExceptionThrown -- ^ An exception was thrown the the resource was being used
+  | UsageTimeout -- ^ The resource has not been used for longer than @idleTiemout@
+  | ManualInvocation -- ^ User invocation of destroy
+  | Purge -- ^ The pool has been cleaned (see @purgeLocalPool@)
+  deriving (Eq, Show)
+
 data Pool a = Pool {
       create :: IO a
     -- ^ Action for creating a new entry to add to the pool.
-    , destroy :: a -> IO ()
+    , destroy :: DestroyReason -> a -> IO ()
     -- ^ Action for destroying an entry that is now done with.
     , numStripes :: Int
     -- ^ The number of stripes (distinct sub-pools) to maintain.
@@ -131,7 +139,7 @@ instance Show (Pool a) where
 createPool
     :: IO a
     -- ^ Action that creates a new resource.
-    -> (a -> IO ())
+    -> (DestroyReason -> a -> IO ())
     -- ^ Action that destroys an existing resource.
     -> Int
     -- ^ The number of stripes (distinct sub-pools) to maintain.
@@ -202,7 +210,7 @@ forkIOLabeledWithUnmask label m = mask_ $ forkIOWithUnmask $ \unmask -> do
 
 -- | Periodically go through all pools, closing any resources that
 -- have been left idle for too long.
-reaper :: (a -> IO ()) -> NominalDiffTime -> V.Vector (LocalPool a) -> IO ()
+reaper :: (DestroyReason -> a -> IO ()) -> NominalDiffTime -> V.Vector (LocalPool a) -> IO ()
 reaper destroy idleTime pools = forever $ do
   threadDelay (1 * 1000000)
   now <- getCurrentTime
@@ -215,18 +223,18 @@ reaper destroy idleTime pools = forever $ do
         modifyTVar_ inUse (subtract (length stale))
       return (map entry stale)
     forM_ resources $ \resource -> do
-      destroy resource `E.catch` \(_::SomeException) -> return ()
+      destroy UsageTimeout resource `E.catch` \(_::SomeException) -> return ()
 
 -- | Destroy all idle resources of the given 'LocalPool' and remove them from
 -- the pool.
-purgeLocalPool :: (a -> IO ()) -> LocalPool a -> IO ()
+purgeLocalPool :: (DestroyReason -> a -> IO ()) -> LocalPool a -> IO ()
 purgeLocalPool destroy LocalPool{..} = do
   resources <- atomically $ do
     idle <- swapTVar entries []
     modifyTVar_ inUse (subtract (length idle))
     return (map entry idle)
   forM_ resources $ \resource ->
-    destroy resource `E.catch` \(_::SomeException) -> return ()
+    destroy Purge resource `E.catch` \(_::SomeException) -> return ()
 
 -- | Temporarily take a resource from a 'Pool', perform an action with
 -- it, and return it to the pool afterwards.
@@ -353,7 +361,7 @@ getLocalPool Pool{..} = do
 -- destroy function.
 destroyResource :: Pool a -> LocalPool a -> a -> IO ()
 destroyResource Pool{..} LocalPool{..} resource = do
-   destroy resource `E.catch` \(_::SomeException) -> return ()
+   destroy ManualInvocation resource `E.catch` \(_::SomeException) -> return ()
    atomically (modifyTVar_ inUse (subtract 1))
 #if __GLASGOW_HASKELL__ >= 700
 {-# INLINABLE destroyResource #-}
